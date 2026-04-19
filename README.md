@@ -4,6 +4,12 @@ Security scanner for Next.js + Supabase repos
 
 > **Badge:** Built for vibe coders who ship fast
 
+## Quick start
+
+```bash
+npx backstop-scanner .
+```
+
 ## What it catches
 
 1. `.env` files that are not listed in `.gitignore`.
