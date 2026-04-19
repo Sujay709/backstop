@@ -4,9 +4,12 @@ import fg from "fast-glob";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+type Confidence = "HIGH" | "MEDIUM" | "LOW";
+
 type Issue = {
   filePath: string;
   description: string;
+  confidence: Confidence;
 };
 
 function toPosix(filePath: string): string {
@@ -87,7 +90,8 @@ function isApiRouteFile(relativePath: string): boolean {
   return normalizedPath.startsWith("app/api/") || normalizedPath.startsWith("pages/api/");
 }
 
-function shouldSkipRlsScanForFile(relativePath: string): boolean {
+/** Test / spec paths — skip Rule 2 and Rule 4. */
+function isTestOrSpecPath(relativePath: string): boolean {
   const normalizedPath = toPosix(relativePath).toLowerCase();
   const basename = path.posix.basename(normalizedPath);
   if (normalizedPath.includes("/test/") || normalizedPath.includes("/tests/")) {
@@ -124,16 +128,258 @@ function isSupabaseStorageFromCall(content: string, matchIndex: number): boolean
   return prevLine.includes(STORAGE_FROM_MARKER);
 }
 
-function hasSupabaseServiceRoleExposure(content: string): boolean {
-  const importsCreateClient =
+/** Rule 2: createClient must be imported from @supabase/supabase-js only (not ssr / auth-helpers). */
+function importsCreateClientFromSupabaseJs(content: string): boolean {
+  return (
     /import\s*{\s*[^}]*\bcreateClient\b[^}]*}\s*from\s*["']@supabase\/supabase-js["']/.test(content) ||
-    /import\s+createClient\s+from\s*["']@supabase\/supabase-js["']/.test(content);
+    /import\s+createClient\s+from\s*["']@supabase\/supabase-js["']/.test(content)
+  );
+}
 
-  if (!importsCreateClient) {
+function hasServiceRoleKeyReference(content: string): boolean {
+  return /SUPABASE_SERVICE_ROLE_KEY/.test(content);
+}
+
+function shouldSkipRule2ForPath(relativePath: string): boolean {
+  const lower = toPosix(relativePath).toLowerCase();
+  if (lower.includes("/api/")) {
+    return true;
+  }
+  if (isTestOrSpecPath(relativePath)) {
+    return true;
+  }
+  return false;
+}
+
+function hasRule2ClientSideServiceRoleExposure(content: string, relativePath: string): boolean {
+  if (shouldSkipRule2ForPath(relativePath)) {
     return false;
   }
+  if (!importsCreateClientFromSupabaseJs(content)) {
+    return false;
+  }
+  return hasServiceRoleKeyReference(content);
+}
 
-  return /SUPABASE_SERVICE_ROLE_KEY/.test(content);
+const JWT_PATTERN = /eyJ[a-zA-Z0-9_-]{20,}/g;
+
+const RULE3_SKIP_FOLDER_SEGMENTS = new Set([
+  "__mocks__",
+  "__fixtures__",
+  "__tests__",
+  "examples",
+  "samples",
+  "docs"
+]);
+
+const RULE3_NAME_SUBSTRINGS = [
+  "example",
+  "sample",
+  "mock",
+  "fixture",
+  "placeholder",
+  "seed",
+  "demo"
+];
+
+function shouldSkipRule3File(relativePath: string): boolean {
+  const norm = toPosix(relativePath);
+  const lower = norm.toLowerCase();
+  if (lower.endsWith(".md") || lower.endsWith(".mdx")) {
+    return true;
+  }
+  const segments = lower.split("/");
+  if (segments.some((seg) => RULE3_SKIP_FOLDER_SEGMENTS.has(seg))) {
+    return true;
+  }
+  const base = path.posix.basename(lower);
+  const stem = base.replace(/\.(tsx|ts|jsx|js)$/i, "");
+  if (RULE3_NAME_SUBSTRINGS.some((s) => stem.includes(s))) {
+    return true;
+  }
+  if (/\btest\b/i.test(stem) || /\bspec\b/i.test(stem)) {
+    return true;
+  }
+  return false;
+}
+
+/** Builds ranges for line and block comments; skips content inside string and template literals. */
+function buildCommentRanges(content: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  let i = 0;
+  const n = content.length;
+
+  while (i < n) {
+    const ch = content[i];
+    const next = i + 1 < n ? content[i + 1] : "";
+
+    if (ch === "/" && next === "/") {
+      if (i > 0 && content[i - 1] === ":") {
+        i += 1;
+        continue;
+      }
+      const start = i;
+      i += 2;
+      while (i < n && content[i] !== "\n") {
+        i += 1;
+      }
+      ranges.push([start, i]);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const start = i;
+      i += 2;
+      while (i + 1 < n && !(content[i] === "*" && content[i + 1] === "/")) {
+        i += 1;
+      }
+      i = i + 2 <= n ? i + 2 : n;
+      ranges.push([start, i]);
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      const q = ch;
+      i += 1;
+      while (i < n) {
+        if (content[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (content[i] === q) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === "`") {
+      i += 1;
+      while (i < n) {
+        if (content[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (content[i] === "`") {
+          i += 1;
+          break;
+        }
+        if (content[i] === "$" && i + 1 < n && content[i + 1] === "{") {
+          i += 2;
+          let depth = 1;
+          while (i < n && depth > 0) {
+            if (content[i] === "{") {
+              depth += 1;
+            } else if (content[i] === "}") {
+              depth -= 1;
+            }
+            i += 1;
+          }
+          continue;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return ranges;
+}
+
+function isOffsetInCommentRanges(offset: number, ranges: Array<[number, number]>): boolean {
+  return ranges.some(([a, b]) => offset >= a && offset < b);
+}
+
+function isJwtAssignedOrArgContext(content: string, matchStart: number): boolean {
+  let i = matchStart - 1;
+  while (i >= 0 && (content[i] === " " || content[i] === "\t")) {
+    i -= 1;
+  }
+  if (i >= 0 && (content[i] === '"' || content[i] === "'" || content[i] === "`")) {
+    i -= 1;
+    while (i >= 0 && (content[i] === " " || content[i] === "\t")) {
+      i -= 1;
+    }
+  }
+  while (i >= 0) {
+    const ch = content[i];
+    if (ch === "=" || ch === "(" || ch === "," || ch === "[" || ch === ":") {
+      return true;
+    }
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      i -= 1;
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+function hasHardcodedJwtCredentialIssue(content: string, relativePath: string): boolean {
+  if (shouldSkipRule3File(relativePath)) {
+    return false;
+  }
+  const commentRanges = buildCommentRanges(content);
+  JWT_PATTERN.lastIndex = 0;
+  for (const match of content.matchAll(JWT_PATTERN)) {
+    if (match.index === undefined) {
+      continue;
+    }
+    if (isOffsetInCommentRanges(match.index, commentRanges)) {
+      continue;
+    }
+    if (!isJwtAssignedOrArgContext(content, match.index)) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+const COMMON_TABLE_WORDS = new Set([
+  "test",
+  "data",
+  "item",
+  "list",
+  "node",
+  "user",
+  "type",
+  "name",
+  "info",
+  "base",
+  "temp"
+]);
+
+function shouldSkipRule4ForPath(relativePath: string): boolean {
+  const lower = toPosix(relativePath).toLowerCase();
+  if (lower.includes("/lib/supabase/") || lower.startsWith("lib/supabase/")) {
+    return true;
+  }
+  const base = path.posix.basename(lower);
+  if (/^client\.(ts|tsx|js|jsx)$/.test(base) && lower.includes("supabase")) {
+    return true;
+  }
+  return false;
+}
+
+function getLineIndexAtOffset(content: string, offset: number): number {
+  return content.slice(0, offset).split(/\r?\n/).length - 1;
+}
+
+function hasStorageWithinLinesOfFrom(content: string, matchIndex: number): boolean {
+  const lines = content.split(/\r?\n/);
+  const lineIdx = getLineIndexAtOffset(content, matchIndex);
+  const start = Math.max(0, lineIdx - 3);
+  const end = Math.min(lines.length - 1, lineIdx + 3);
+  for (let l = start; l <= end; l += 1) {
+    if (lines[l].toLowerCase().includes("storage")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function readGitignorePatterns(rootDir: string): Promise<string[]> {
@@ -144,6 +390,60 @@ async function readGitignorePatterns(rootDir: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+async function loadRlsReferenceCorpus(rootDir: string): Promise<string[]> {
+  const sqlPaths = await fg("**/*.sql", {
+    cwd: rootDir,
+    onlyFiles: true,
+    dot: true,
+    absolute: false,
+    ignore: ["**/node_modules/**", "**/.git/**"]
+  });
+  const contents: string[] = [];
+  for (const sqlPath of sqlPaths) {
+    try {
+      contents.push((await fs.readFile(path.join(rootDir, sqlPath), "utf8")).toLowerCase());
+    } catch {
+      continue;
+    }
+  }
+  return contents;
+}
+
+const visibleAuthChecks = [
+  "getServerSession",
+  "auth()",
+  "currentUser()",
+  "verifyToken",
+  "Authorization",
+  "requireAuth",
+  "withAuth",
+  "authenticate",
+  "isAuthenticated",
+  "checkAuth",
+  "validateToken",
+  "session.user",
+  "req.user",
+  "x-api-key",
+  "API_KEY",
+  "WEBHOOK_SECRET"
+];
+
+const RULE5_FILENAME_SKIP_SUBSTRINGS = [
+  "webhook",
+  "cron",
+  "internal",
+  "worker",
+  "job",
+  "stripe",
+  "resend",
+  "clerk"
+];
+
+function shouldSkipRule5ForFilename(relativePath: string): boolean {
+  const base = path.posix.basename(relativePath).toLowerCase();
+  return RULE5_FILENAME_SKIP_SUBSTRINGS.some((s) => base.includes(s));
 }
 
 async function scanDirectory(rootDir: string): Promise<Issue[]> {
@@ -157,31 +457,9 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
   });
 
   const gitignorePatterns = await readGitignorePatterns(rootDir);
-  const migrationFiles = await fg("supabase/migrations/**/*", {
-    cwd: rootDir,
-    onlyFiles: true,
-    dot: true,
-    absolute: false,
-    ignore: ["**/node_modules/**", "**/.git/**"]
-  });
-  const migrationContents: string[] = [];
-  for (const migrationPath of migrationFiles) {
-    try {
-      migrationContents.push((await fs.readFile(path.join(rootDir, migrationPath), "utf8")).toLowerCase());
-    } catch {
-      continue;
-    }
-  }
+  const rlsReferenceContents = await loadRlsReferenceCorpus(rootDir);
 
-  const hardcodedSupabaseJwtPattern = /eyJ[a-zA-Z0-9_-]{20,}/;
   const fromCallPattern = /\.from\(\s*['"`]([a-zA-Z0-9_:-]+)['"`]\s*\)/g;
-  const visibleAuthChecks = [
-    "getServerSession",
-    "auth()",
-    "currentUser()",
-    "verifyToken",
-    "Authorization"
-  ];
 
   for (const relativePath of files) {
     const normalizedRelativePath = toPosix(relativePath);
@@ -194,7 +472,8 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
       if (!isIgnored) {
         issues.push({
           filePath: normalizedRelativePath,
-          description: ".env file is not listed in .gitignore"
+          description: ".env file is not listed in .gitignore",
+          confidence: "HIGH"
         });
       }
     }
@@ -207,22 +486,27 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         continue;
       }
 
-      if (isInsideClientSideDir(normalizedRelativePath) && hasSupabaseServiceRoleExposure(content)) {
+      if (
+        isInsideClientSideDir(normalizedRelativePath) &&
+        hasRule2ClientSideServiceRoleExposure(content, normalizedRelativePath)
+      ) {
         issues.push({
           filePath: normalizedRelativePath,
           description:
-            "Potential client-side exposure: imports createClient from @supabase/supabase-js and uses SUPABASE_SERVICE_ROLE_KEY"
+            "Potential client-side exposure: imports createClient from @supabase/supabase-js and uses SUPABASE_SERVICE_ROLE_KEY",
+          confidence: "HIGH"
         });
       }
 
-      if (hardcodedSupabaseJwtPattern.test(content)) {
+      if (hasHardcodedJwtCredentialIssue(content, normalizedRelativePath)) {
         issues.push({
           filePath: normalizedRelativePath,
-          description: "Hardcoded Supabase credential-like JWT string found in source file"
+          description: "Hardcoded Supabase credential-like JWT string found in source file",
+          confidence: "MEDIUM"
         });
       }
 
-      if (!shouldSkipRlsScanForFile(normalizedRelativePath)) {
+      if (!isTestOrSpecPath(normalizedRelativePath) && !shouldSkipRule4ForPath(normalizedRelativePath)) {
         const referencedTables = new Set<string>();
         fromCallPattern.lastIndex = 0;
         for (const match of content.matchAll(fromCallPattern)) {
@@ -232,31 +516,45 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
           if (isSupabaseStorageFromCall(content, match.index)) {
             continue;
           }
-          const tableName = match[1].toLowerCase();
-          if (!tableName.includes("-")) {
-            referencedTables.add(tableName);
+          if (hasStorageWithinLinesOfFrom(content, match.index)) {
+            continue;
           }
+          const tableName = match[1].toLowerCase();
+          if (tableName.includes("-")) {
+            continue;
+          }
+          if (tableName.length < 4) {
+            continue;
+          }
+          if (COMMON_TABLE_WORDS.has(tableName)) {
+            continue;
+          }
+          referencedTables.add(tableName);
         }
 
         for (const tableName of referencedTables) {
-          const foundInMigrations = migrationContents.some((migrationContent) =>
-            migrationContent.includes(tableName)
-          );
-          if (!foundInMigrations) {
+          const foundInCorpus = rlsReferenceContents.some((sqlContent) => sqlContent.includes(tableName));
+          if (!foundInCorpus) {
             issues.push({
               filePath: normalizedRelativePath,
-              description: `${tableName} table queried with no RLS migration found`
+              description: `${tableName} table queried with no RLS migration found`,
+              confidence: "LOW"
             });
           }
         }
       }
 
-      if (isApiRouteFile(normalizedRelativePath) && /SUPABASE_SERVICE_ROLE_KEY/.test(content)) {
+      if (
+        isApiRouteFile(normalizedRelativePath) &&
+        /SUPABASE_SERVICE_ROLE_KEY/.test(content) &&
+        !shouldSkipRule5ForFilename(normalizedRelativePath)
+      ) {
         const hasVisibleAuthCheck = visibleAuthChecks.some((authCheck) => content.includes(authCheck));
         if (!hasVisibleAuthCheck) {
           issues.push({
             filePath: normalizedRelativePath,
-            description: "API route uses service role key with no visible auth check"
+            description: "API route uses service role key with no visible auth check",
+            confidence: "HIGH"
           });
         }
       }
@@ -269,13 +567,27 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
 function printResults(issues: Issue[]): void {
   if (issues.length === 0) {
     console.log("No issues found.");
+    console.log("Found 0 issues: 0 high, 0 medium, 0 low");
     return;
   }
 
-  console.log("Issues found:");
   for (const issue of issues) {
-    console.log(`- ${issue.filePath}: ${issue.description}`);
+    console.log(`[${issue.confidence}] - ${issue.filePath}: ${issue.description}`);
   }
+
+  let high = 0;
+  let medium = 0;
+  let low = 0;
+  for (const issue of issues) {
+    if (issue.confidence === "HIGH") {
+      high += 1;
+    } else if (issue.confidence === "MEDIUM") {
+      medium += 1;
+    } else {
+      low += 1;
+    }
+  }
+  console.log(`Found ${issues.length} issues: ${high} high, ${medium} medium, ${low} low`);
 }
 
 async function main(): Promise<void> {
