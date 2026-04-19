@@ -90,7 +90,6 @@ function isApiRouteFile(relativePath: string): boolean {
   return normalizedPath.startsWith("app/api/") || normalizedPath.startsWith("pages/api/");
 }
 
-/** Test / spec paths — skip Rule 2 and Rule 4. */
 function isTestOrSpecPath(relativePath: string): boolean {
   const normalizedPath = toPosix(relativePath).toLowerCase();
   const basename = path.posix.basename(normalizedPath);
@@ -107,7 +106,6 @@ function isTestOrSpecPath(relativePath: string): boolean {
 
 const STORAGE_FROM_MARKER = ".storage.from(";
 
-/** True if this `.from(` is part of Supabase Storage (same or previous source line). */
 function isSupabaseStorageFromCall(content: string, matchIndex: number): boolean {
   const beforeMatch = content.slice(0, matchIndex);
   const lineStart = beforeMatch.lastIndexOf("\n") + 1;
@@ -128,7 +126,6 @@ function isSupabaseStorageFromCall(content: string, matchIndex: number): boolean
   return prevLine.includes(STORAGE_FROM_MARKER);
 }
 
-/** Rule 2: createClient must be imported from @supabase/supabase-js only (not ssr / auth-helpers). */
 function importsCreateClientFromSupabaseJs(content: string): boolean {
   return (
     /import\s*{\s*[^}]*\bcreateClient\b[^}]*}\s*from\s*["']@supabase\/supabase-js["']/.test(content) ||
@@ -203,7 +200,6 @@ function shouldSkipRule3File(relativePath: string): boolean {
   return false;
 }
 
-/** Builds ranges for line and block comments; skips content inside string and template literals. */
 function buildCommentRanges(content: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
   let i = 0;
@@ -446,6 +442,39 @@ function shouldSkipRule5ForFilename(relativePath: string): boolean {
   return RULE5_FILENAME_SKIP_SUBSTRINGS.some((s) => base.includes(s));
 }
 
+const RULE6_AUTH_PATTERNS = [
+  "getUser",
+  "useUser",
+  "useSession",
+  "session",
+  "user.id",
+  "userId",
+  "user?.id",
+  "auth.uid",
+  "currentUser"
+];
+
+function isClientComponent(content: string): boolean {
+  const firstFiveLines = content.split(/\r?\n/).slice(0, 5).join("\n");
+  return /['"]use client['"]/.test(firstFiveLines);
+}
+
+function hasDirectDbWrite(content: string): boolean {
+  return /\.(insert|update|delete|upsert)\(/.test(content);
+}
+
+function hasSupabaseClientUsage(content: string): boolean {
+  return (
+    /createClient/.test(content) ||
+    /from\(['"]@supabase\/supabase-js['"]\)/.test(content) ||
+    /from\(['"]@supabase\/ssr['"]\)/.test(content)
+  );
+}
+
+function hasRule6AuthCheck(content: string): boolean {
+  return RULE6_AUTH_PATTERNS.some((check) => content.includes(check));
+}
+
 async function scanDirectory(rootDir: string): Promise<Issue[]> {
   const issues: Issue[] = [];
   const files = await fg("**/*", {
@@ -465,6 +494,7 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
     const normalizedRelativePath = toPosix(relativePath);
     const basename = path.posix.basename(normalizedRelativePath);
 
+    // Rule 1: .env not in .gitignore
     if (basename === ".env") {
       const isIgnored = gitignorePatterns.some((pattern) =>
         matchesGitignorePattern(normalizedRelativePath, pattern)
@@ -486,6 +516,7 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         continue;
       }
 
+      // Rule 2: client-side service role key exposure
       if (
         isInsideClientSideDir(normalizedRelativePath) &&
         hasRule2ClientSideServiceRoleExposure(content, normalizedRelativePath)
@@ -498,6 +529,7 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         });
       }
 
+      // Rule 3: hardcoded JWT credentials
       if (hasHardcodedJwtCredentialIssue(content, normalizedRelativePath)) {
         issues.push({
           filePath: normalizedRelativePath,
@@ -506,6 +538,7 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         });
       }
 
+      // Rule 4: table queried with no RLS migration
       if (!isTestOrSpecPath(normalizedRelativePath) && !shouldSkipRule4ForPath(normalizedRelativePath)) {
         const referencedTables = new Set<string>();
         fromCallPattern.lastIndex = 0;
@@ -544,6 +577,7 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         }
       }
 
+      // Rule 5: API route with service role key and no auth check
       if (
         isApiRouteFile(normalizedRelativePath) &&
         /SUPABASE_SERVICE_ROLE_KEY/.test(content) &&
@@ -557,6 +591,21 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
             confidence: "HIGH"
           });
         }
+      }
+
+      // Rule 6: client component writing to DB with no auth check
+      if (
+        !isTestOrSpecPath(normalizedRelativePath) &&
+        isClientComponent(content) &&
+        hasDirectDbWrite(content) &&
+        hasSupabaseClientUsage(content) &&
+        !hasRule6AuthCheck(content)
+      ) {
+        issues.push({
+          filePath: normalizedRelativePath,
+          description: "client component writes directly to database with no visible auth check",
+          confidence: "HIGH"
+        });
       }
     }
   }
