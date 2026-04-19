@@ -101,6 +101,29 @@ function shouldSkipRlsScanForFile(relativePath: string): boolean {
   );
 }
 
+const STORAGE_FROM_MARKER = ".storage.from(";
+
+/** True if this `.from(` is part of Supabase Storage (same or previous source line). */
+function isSupabaseStorageFromCall(content: string, matchIndex: number): boolean {
+  const beforeMatch = content.slice(0, matchIndex);
+  const lineStart = beforeMatch.lastIndexOf("\n") + 1;
+  let lineEnd = content.indexOf("\n", matchIndex);
+  if (lineEnd === -1) {
+    lineEnd = content.length;
+  }
+  const currentLine = content.slice(lineStart, lineEnd);
+  if (currentLine.includes(STORAGE_FROM_MARKER)) {
+    return true;
+  }
+  if (lineStart === 0) {
+    return false;
+  }
+  const beforeCurrentLine = content.slice(0, lineStart - 1);
+  const prevLineStart = beforeCurrentLine.lastIndexOf("\n") + 1;
+  const prevLine = content.slice(prevLineStart, lineStart - 1);
+  return prevLine.includes(STORAGE_FROM_MARKER);
+}
+
 function hasSupabaseServiceRoleExposure(content: string): boolean {
   const importsCreateClient =
     /import\s*{\s*[^}]*\bcreateClient\b[^}]*}\s*from\s*["']@supabase\/supabase-js["']/.test(content) ||
@@ -203,11 +226,15 @@ async function scanDirectory(rootDir: string): Promise<Issue[]> {
         const referencedTables = new Set<string>();
         fromCallPattern.lastIndex = 0;
         for (const match of content.matchAll(fromCallPattern)) {
-          if (match[1]) {
-            const tableName = match[1].toLowerCase();
-            if (!tableName.includes("-")) {
-              referencedTables.add(tableName);
-            }
+          if (!match[1] || match.index === undefined) {
+            continue;
+          }
+          if (isSupabaseStorageFromCall(content, match.index)) {
+            continue;
+          }
+          const tableName = match[1].toLowerCase();
+          if (!tableName.includes("-")) {
+            referencedTables.add(tableName);
           }
         }
 
