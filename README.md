@@ -1,5 +1,7 @@
 # backstop-scanner
 
+[![npm version](https://img.shields.io/npm/v/backstop-scanner)](https://www.npmjs.com/package/backstop-scanner)
+
 Security scanner for Next.js + Supabase repos.
 Built for vibe coders who ship fast.
 
@@ -40,19 +42,28 @@ If you want to run it repeatedly without npx:
 3. Hardcoded JWT credentials - finds hardcoded Supabase keys in source files
 4. Missing RLS migration - flags tables queried with no matching RLS migration file
 5. Unprotected service role API route - API routes using service role key with no auth check
+6. Unauthenticated client writes - client components writing to DB with no auth check
 
 ## Example output
 
-    Issues found:
-    - .env: .env file is not listed in .gitignore
-    - app/dashboard/page.tsx: client-side service role key exposure
-    - lib/supabase/client.ts: hardcoded Supabase JWT credential
-    - app/api/reports/route.ts: reports table queried with no RLS migration found
-    - pages/api/admin.ts: API route uses service role key with no visible auth check
+    [HIGH] - components/footer-primary.tsx: client component writes directly to database with no visible auth check
+    [LOW]  - components/footer-primary.tsx: user_email_list table queried with no RLS migration found
+    [HIGH] - pages/api/admin.ts: API route uses service role key with no visible auth check
+    [HIGH] - lib/supabase/client.ts: hardcoded Supabase JWT credential
+
+    Found 4 issues: 3 high, 0 medium, 1 low
+
+## Real world example
+
+Ran backstop-scanner on a popular open source Next.js + Supabase
+starter kit and found a HIGH severity issue in seconds — a client
+component inserting directly into a database table with no auth
+check and no RLS policy.
 
 ## Stack support
 
-Next.js App Router and Pages Router, Supabase, works with Cursor and any AI coding tool
+Next.js App Router and Pages Router, Supabase, works with Cursor
+and any AI coding tool
 
 ## Contributing
 
