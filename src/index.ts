@@ -641,8 +641,10 @@ function printResults(issues: Issue[]): void {
 
 async function main(): Promise<void> {
   const inputPath = process.argv[2];
-  if (!inputPath) {
-    console.error("Usage: backstop-scanner <folder-path>");
+  const useExitCode = process.argv.includes("--exit-code");
+
+  if (!inputPath || inputPath.startsWith("--")) {
+    console.error("Usage: backstop-scanner <folder-path> [--exit-code]");
     process.exitCode = 1;
     return;
   }
@@ -663,6 +665,10 @@ async function main(): Promise<void> {
 
   const issues = await scanDirectory(rootDir);
   printResults(issues);
+
+  if (useExitCode && issues.some((i) => i.confidence === "HIGH")) {
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error: unknown) => {

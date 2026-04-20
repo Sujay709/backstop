@@ -35,6 +35,22 @@ If you want to run it repeatedly without npx:
     npx backstop-scanner ./my-app
     npx backstop-scanner C:\projects\my-saas
 
+## GitHub Actions (CI integration)
+
+Add this to `.github/workflows/backstop.yml` in your repo:
+
+    name: Backstop Security Scan
+    on: [pull_request]
+    jobs:
+      scan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v3
+          - run: npx backstop-scanner . --exit-code
+
+The `--exit-code` flag makes the PR check fail automatically
+when HIGH severity issues are found.
+
 ## What it catches
 
 1. .env not in .gitignore - flags .env files that could be accidentally committed
